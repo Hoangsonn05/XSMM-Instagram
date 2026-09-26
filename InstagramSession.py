@@ -5,11 +5,9 @@ import sys
 import json
 import time
 import random
-import math
 import logging
 import requests
 from datetime import datetime
-from urllib.parse import urlsplit, urlunsplit
 from colorama import init, Fore, Style
 
 init(autoreset=True)
@@ -144,10 +142,6 @@ class InstagramAPI:
     BASE = "https://www.instagram.com"
     APP_ID = "936619743392459"
 
-    SESSION_DISABLE_STATUSES = frozenset({
-        "AUTH_INVALID", "LOGIN_REQUIRED", "CHECKPOINT", "SUSPENDED",
-    })
-
     DOC_LIKE = ("usePolarisLikeMediaXIGLikeMutation", "27182485238052618")
     DOC_UNLIKE = ("usePolarisUnlikeMediaXIGUnlikeMutation", "27182485238052619")
     DOC_FOLLOW = ("usePolarisFollowUserFollowMutation", "27767812149509802")
@@ -168,14 +162,12 @@ class InstagramAPI:
         self.jazoest = None
         self.rev = None
         self.hs = None
-        self.last_session_diagnostic = {
-            "status": "UNKNOWN_RESPONSE",
-            "stage": "INIT",
-            "http_status": None,
-            "content_type": "",
-            "final_url": "",
-            "reason": "NOT_CHECKED",
-        }
+
+        # trạng thái sau load()
+        self.alive = False
+        self.suspended = False
+        self.load_error = None
+
         self.session = self._build_session()
 
     @staticmethod
@@ -199,191 +191,91 @@ class InstagramAPI:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/153.0.0.0 Safari/537.36"
             ),
-            "Accept": "*/*",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8,vi;q=0.7",
             "X-CSRFToken": self.csrf_token or "",
             "X-IG-App-ID": self.APP_ID,
+            "X-ASBD-ID": "129477",
+            "X-IG-WWW-Claim": "0",
+            "X-Requested-With": "XMLHttpRequest",
             "Referer": f"{self.BASE}/",
             "Origin": self.BASE,
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Upgrade-Insecure-Requests": "1",
         })
         return s
 
+    # ------------------------------------------------------------------ #
+    #  LOAD + CHECK SESSION QUA HTML TOKEN
+    # ------------------------------------------------------------------ #
     def load(self) -> bool:
+        """
+        GET instagram.com/ rồi soi HTML.
+        Trả về True nếu session còn live, False nếu die/suspended.
+        Cập nhật: self.alive, self.suspended, self.load_error
+        """
+        self.alive = False
+        self.suspended = False
+        self.load_error = None
+
         try:
-            r = self.session.get(f"{self.BASE}/", timeout=self.timeout)
-        except requests.RequestException as exc:
-            self._set_session_diagnostic(
-                "NETWORK_ERROR", "LOAD_HOME",
-                reason=f"REQUEST_{type(exc).__name__.upper()}",
-            )
-            return False
-        except Exception as exc:
-            self._set_session_diagnostic(
-                "UNKNOWN_RESPONSE", "LOAD_HOME",
-                reason=f"UNEXPECTED_{type(exc).__name__.upper()}",
-            )
+            r = self.session.get(self.BASE, timeout=self.timeout,
+                                 allow_redirects=True)
+        except Exception as e:
+            self.load_error = f"request EXC: {e}"
             return False
 
-        status = getattr(r, "status_code", None)
-        marker_status = self._classify_response_marker(r)
-        if status == 429:
-            self._set_session_diagnostic(
-                "RATE_LIMITED", "LOAD_HOME", r, "HTTP_429",
-            )
+        # 1. check suspended trước (URL hoặc header)
+        final_url = (r.url or "").lower()
+        loc = (r.headers.get("Location") or "").lower()
+        if "suspended" in final_url or "suspended" in loc:
+            self.suspended = True
+            self.load_error = "account suspended"
             return False
-        if marker_status:
-            self._set_session_diagnostic(
-                marker_status, "LOAD_HOME", r,
-                f"{marker_status}_MARKER",
-            )
+
+        html = r.text or ""
+        low = html.lower()
+
+        # 2. redirect về login / challenge
+        if "/accounts/login" in final_url or "/challenge/" in final_url:
+            self.load_error = f"redirect: {final_url}"
             return False
-        if status != 200:
-            diagnostic_status = "HTTP_ERROR" if status is not None else "UNKNOWN_RESPONSE"
-            self._set_session_diagnostic(
-                diagnostic_status, "LOAD_HOME", r,
-                f"HTTP_{status}" if status is not None else "MISSING_HTTP_STATUS",
-            )
+
+        # 3. trang HTML có chữ suspended / disabled
+        if "your account has been suspended" in low \
+           or "account has been disabled" in low \
+           or '"userstatus":"suspended"' in low:
+            self.suspended = True
+            self.load_error = "html suspended"
             return False
-        self._extract_tokens(r.text)
-        self._set_session_diagnostic("LOAD_OK", "LOAD_HOME", r, "HOME_LOADED")
-        return True
 
-    @staticmethod
-    def _safe_url(value) -> str:
-        """Keep only URL origin/path so diagnostics never retain query secrets."""
-        if not value:
-            return ""
-        try:
-            parts = urlsplit(str(value))
-            hostname = parts.hostname or ""
-            if ":" in hostname:
-                hostname = f"[{hostname}]"
-            port = f":{parts.port}" if parts.port is not None else ""
-            return urlunsplit((parts.scheme, f"{hostname}{port}",
-                               parts.path, "", ""))
-        except Exception:
-            return ""
+        # 4. thử lấy token từ HTML
+        self._extract_tokens(html)
 
-    @staticmethod
-    def _response_headers(response) -> dict:
-        headers = getattr(response, "headers", None)
-        return headers if hasattr(headers, "get") else {}
+        # 5. check "viewerId" khớp ds_user_id → chắc chắn live
+        m = re.search(r'"viewerId"\s*:\s*"(\d+)"', html)
+        if m:
+            if m.group(1) == str(self.ds_user_id):
+                self.alive = True
+                return True
+            else:
+                self.load_error = f"viewerId mismatch ({m.group(1)})"
+                return False
 
-    def _set_session_diagnostic(self, status, stage, response=None, reason=""):
-        headers = self._response_headers(response) if response is not None else {}
-        self.last_session_diagnostic = {
-            "status": status,
-            "stage": stage,
-            "http_status": getattr(response, "status_code", None)
-            if response is not None else None,
-            "content_type": str(headers.get("content-type", "") or ""),
-            "final_url": self._safe_url(getattr(response, "url", ""))
-            if response is not None else "",
-            "reason": reason,
-        }
-        return self.last_session_diagnostic
+        # 6. fallback: HTML có "viewer":{...} + csrf_token → vẫn coi live
+        if '"viewer":{' in html and self.csrf_token:
+            self.alive = True
+            return True
 
-    @classmethod
-    def _classify_response_marker(cls, response, json_data=None):
-        headers = cls._response_headers(response)
-        final_url = cls._safe_url(getattr(response, "url", "")).lower()
-        location = cls._safe_url(headers.get("location", "")).lower()
-        url_evidence = f"{final_url} {location}"
+        # 7. fallback cuối: có csrf_token lấy từ HTML + có fb_dtsg → live
+        if self.fb_dtsg and self.lsd:
+            self.alive = True
+            return True
 
-        if any(marker in url_evidence for marker in
-               ("/challenge", "/checkpoint")):
-            return "CHECKPOINT"
-        if "/accounts/suspended" in url_evidence:
-            return "SUSPENDED"
-        if "/accounts/login" in url_evidence:
-            return "LOGIN_REQUIRED"
-
-        evidence_parts = []
-        if json_data is not None:
-            cls._collect_error_evidence(json_data, evidence_parts)
-        try:
-            body = str(getattr(response, "text", "") or "")[:100000].lower()
-        except Exception:
-            body = ""
-        evidence = " ".join(evidence_parts).lower()
-        if (any(marker in evidence for marker in (
-                "checkpoint_url", "checkpoint_required",
-                "challenge_required", "challenge_url")) or
-                any(marker in body for marker in (
-                    '"checkpoint_url":', '"challenge_url":',
-                    '"message":"challenge_required"'))):
-            return "CHECKPOINT"
-        if (any(marker in evidence for marker in (
-                "login_required", "login required", "please log in",
-                "not logged in")) or
-                any(marker in body for marker in (
-                    '"message":"login_required"',
-                    '<title>login • instagram</title>',
-                    'id="loginform"'))):
-            return "LOGIN_REQUIRED"
-        if any(marker in evidence for marker in (
-                "rate_limit", "rate limit", "too many requests",
-                "please wait a few minutes")):
-            return "RATE_LIMITED"
-        if any(marker in evidence for marker in (
-                "invalid_session", "invalid session", "session_expired",
-                "session expired", "invalid cookie")):
-            return "AUTH_INVALID"
-        return None
-
-    @classmethod
-    def _collect_error_evidence(cls, value, output, depth=0):
-        """Inspect bounded error metadata internally; never store response data."""
-        if depth > 4 or len(output) >= 30:
-            return
-        if isinstance(value, dict):
-            for key, item in value.items():
-                normalized = str(key).lower()
-                if normalized in {
-                    "message", "error", "error_type", "error_title",
-                    "code", "error_code", "status", "checkpoint_url",
-                    "challenge", "challenge_url",
-                } and isinstance(item, (str, int, float, bool)):
-                    output.append(f"{normalized}:{str(item)[:500]}")
-                elif isinstance(item, (dict, list)):
-                    cls._collect_error_evidence(item, output, depth + 1)
-        elif isinstance(value, list):
-            for item in value[:20]:
-                cls._collect_error_evidence(item, output, depth + 1)
-
-    @staticmethod
-    def _parse_json_response(response):
-        try:
-            return True, response.json()
-        except Exception:
-            return False, None
-
-    @classmethod
-    def diagnostic_requires_disable(cls, diagnostic) -> bool:
-        return bool(diagnostic) and diagnostic.get("status") in cls.SESSION_DISABLE_STATUSES
-
-    def session_diagnostic_message(self) -> str:
-        diagnostic = self.last_session_diagnostic or {}
-        status = diagnostic.get("status", "UNKNOWN_RESPONSE")
-        messages = {
-            "AUTH_INVALID": "Session/cookie không còn hợp lệ",
-            "LOGIN_REQUIRED": "Instagram yêu cầu đăng nhập lại",
-            "CHECKPOINT": "Instagram yêu cầu checkpoint/xác minh",
-            "SUSPENDED": "Tài khoản Instagram bị suspended",
-            "RATE_LIMITED": "Instagram đang giới hạn request",
-            "NETWORK_ERROR": "Không kiểm tra được session do lỗi mạng",
-            "NON_JSON_RESPONSE": "Instagram trả response không phải JSON",
-            "MALFORMED_RESPONSE": "Instagram trả response sai cấu trúc",
-            "UNKNOWN_RESPONSE": "Không xác định được trạng thái session",
-        }
-        if status == "HTTP_ERROR":
-            code = diagnostic.get("http_status")
-            suffix = f": HTTP {code}" if code is not None else ""
-            return f"Kiểm tra session thất bại{suffix}"
-        return messages.get(status, "Không xác định được trạng thái session")
+        self.load_error = "không tìm thấy token session trong HTML"
+        return False
 
     def _extract_tokens(self, html: str):
         m = re.findall(r'"DTSGInitialData",\[\],\{"token":"([^"]+)"\}', html)
@@ -407,6 +299,13 @@ class InstagramAPI:
             self.jazoest = m.group(1)
         elif self.fb_dtsg:
             self.jazoest = "2" + str(sum(ord(c) for c in self.fb_dtsg))
+
+    # ------------------------------------------------------------------ #
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def is_suspended(self) -> bool:
+        return self.suspended
 
     def request(self, method, path, **kw):
         url = path if path.startswith("http") else f"{self.BASE}{path}"
@@ -461,105 +360,34 @@ class InstagramAPI:
             return None
 
     def me(self):
+        """
+        Lấy username từ HTML trang chủ (không dùng API info nữa).
+        """
         try:
-            r = self.get(f"/api/v1/users/{self.ds_user_id}/info/")
+            r = self.session.get(f"{self.BASE}/{self.ds_user_id}/",
+                                 timeout=self.timeout,
+                                 allow_redirects=True)
         except Exception:
             return None
         if r.status_code != 200:
             return None
-        try:
-            u = r.json().get("user", {})
-        except Exception:
+        html = r.text or ""
+        m = re.search(r'"username"\s*:\s*"([^"]+)"', html)
+        uname = m.group(1) if m else None
+        if not uname:
+            # thử meta og:title
+            m = re.search(r'<meta property="og:title" content="([^"]+)"', html)
+            if m:
+                uname = m.group(1).split(" ")[0].lstrip("@")
+        if not uname:
             return None
-        return {k: u.get(k) for k in
-                ("username", "full_name", "pk", "follower_count", "following_count")}
-
-    def is_alive(self):
-        return self.diagnose_session().get("status") == "LIVE"
-
-    def diagnose_session(self):
-        try:
-            r = self.get(f"/api/v1/users/{self.ds_user_id}/info/")
-        except requests.RequestException as exc:
-            return self._set_session_diagnostic(
-                "NETWORK_ERROR", "ALIVE_CHECK",
-                reason=f"REQUEST_{type(exc).__name__.upper()}",
-            )
-        except Exception as exc:
-            return self._set_session_diagnostic(
-                "UNKNOWN_RESPONSE", "ALIVE_CHECK",
-                reason=f"UNEXPECTED_{type(exc).__name__.upper()}",
-            )
-
-        status = getattr(r, "status_code", None)
-        parsed, data = self._parse_json_response(r)
-        marker_status = self._classify_response_marker(
-            r, data if parsed else None,
-        )
-        if status == 429:
-            return self._set_session_diagnostic(
-                "RATE_LIMITED", "ALIVE_CHECK", r, "HTTP_429",
-            )
-        if marker_status:
-            return self._set_session_diagnostic(
-                marker_status, "ALIVE_CHECK", r,
-                f"{marker_status}_MARKER",
-            )
-        if status != 200:
-            diagnostic_status = "HTTP_ERROR" if status is not None else "UNKNOWN_RESPONSE"
-            return self._set_session_diagnostic(
-                diagnostic_status, "ALIVE_CHECK", r,
-                f"HTTP_{status}" if status is not None else "MISSING_HTTP_STATUS",
-            )
-        if not parsed:
-            return self._set_session_diagnostic(
-                "NON_JSON_RESPONSE", "ALIVE_CHECK", r,
-                "JSON_PARSE_FAILED",
-            )
-        if not isinstance(data, dict):
-            return self._set_session_diagnostic(
-                "MALFORMED_RESPONSE", "ALIVE_CHECK", r,
-                "ROOT_NOT_OBJECT",
-            )
-        user = data.get("user")
-        if not isinstance(user, dict) or not user:
-            return self._set_session_diagnostic(
-                "MALFORMED_RESPONSE", "ALIVE_CHECK", r,
-                "USER_OBJECT_MISSING",
-            )
-        user_id = user.get("pk", user.get("id"))
-        if user_id is not None and str(user_id) != str(self.ds_user_id):
-            return self._set_session_diagnostic(
-                "MALFORMED_RESPONSE", "ALIVE_CHECK", r,
-                "USER_ID_MISMATCH",
-            )
-        if user_id is None and not user.get("username"):
-            return self._set_session_diagnostic(
-                "MALFORMED_RESPONSE", "ALIVE_CHECK", r,
-                "USER_IDENTITY_MISSING",
-            )
-        return self._set_session_diagnostic(
-            "LIVE", "ALIVE_CHECK", r, "VALID_USER_OBJECT",
-        )
-
-    def is_suspended(self) -> bool:
-        """
-        Kiểm tra account có bị suspended không.
-        Truy cập instagram.com → nếu URL redirect chứa 'suspended' → bị ban.
-        """
-        try:
-            r = self.session.get(self.BASE, timeout=self.timeout,
-                                 allow_redirects=True)
-            final_url = (r.url or "").lower()
-            if "suspended" in final_url:
-                return True
-            # đôi khi requests không follow hết → check header Location
-            loc = (r.headers.get("Location") or "").lower()
-            if "suspended" in loc:
-                return True
-            return False
-        except Exception:
-            return False
+        return {
+            "username": uname,
+            "full_name": None,
+            "pk": self.ds_user_id,
+            "follower_count": None,
+            "following_count": None,
+        }
 
     @staticmethod
     def _pk(media_id: str) -> str:
@@ -708,89 +536,11 @@ class XsmmClient:
 
 
 # ====================================================================== #
-DEFAULT_RUN_CONFIG = {
-    "total_jobs": 0,
-    "like_delay_min": 2.0,
-    "like_delay_max": 5.0,
-    "follow_delay_min": 2.0,
-    "follow_delay_max": 5.0,
-    "failed_delay_min": 2.0,
-    "failed_delay_max": 5.0,
-    "account_delay_min": 0.0,
-    "account_delay_max": 0.0,
-    "jobs_per_cycle": 0,
-    "cycle_sleep": 60,
-    "empty_sleep": 10,
-    "follow_cache_min": 8,
-    "follow_cache_max": 12,
-}
-
-
-def validate_number_range(minimum, maximum, label, minimum_allowed=0):
-    for value in (minimum, maximum):
-        if (isinstance(value, bool) or not isinstance(value, (int, float))
-                or not math.isfinite(value)):
-            raise ValueError(f"{label} phải là số hợp lệ")
-        if value < minimum_allowed:
-            raise ValueError(f"{label} phải >= {minimum_allowed}")
-    if minimum > maximum:
-        raise ValueError(f"{label} min không được lớn hơn max")
-    return float(minimum), float(maximum)
-
-
-def validate_integer(value, label, minimum_allowed=0):
-    if (isinstance(value, bool) or not isinstance(value, int)
-            or value < minimum_allowed):
-        raise ValueError(f"{label} phải là số nguyên >= {minimum_allowed}")
-    return value
-
-
-def normalize_run_config(data=None):
-    if data is None:
-        data = {}
-    if not isinstance(data, dict):
-        raise ValueError("run_config phải là object")
-
-    config = dict(DEFAULT_RUN_CONFIG)
-    for key in config:
-        if key in data:
-            config[key] = data[key]
-
-    for prefix, label in (
-        ("like_delay", "Like delay"),
-        ("follow_delay", "Follow delay"),
-        ("failed_delay", "Failed delay"),
-        ("account_delay", "Account delay"),
-    ):
-        minimum, maximum = validate_number_range(
-            config[f"{prefix}_min"], config[f"{prefix}_max"], label
-        )
-        config[f"{prefix}_min"] = minimum
-        config[f"{prefix}_max"] = maximum
-
-    for key, label in (
-        ("total_jobs", "Tổng số job"),
-        ("jobs_per_cycle", "Số job mỗi chu kỳ"),
-        ("cycle_sleep", "Thời gian nghỉ chu kỳ"),
-        ("empty_sleep", "Thời gian nghỉ khi hết task"),
-    ):
-        config[key] = validate_integer(config[key], label)
-
-    cache_min = validate_integer(config["follow_cache_min"], "Follow cache min", 1)
-    cache_max = validate_integer(config["follow_cache_max"], "Follow cache max", 1)
-    if cache_min > cache_max:
-        raise ValueError("Follow cache min không được lớn hơn max")
-    config["follow_cache_min"] = cache_min
-    config["follow_cache_max"] = cache_max
-    return config
-
-
 class Config:
     def __init__(self, path="config.json"):
         self.path = path
         self.xsmm_token = ""
         self.debug = False
-        self.run_config = normalize_run_config()
         self.load()
 
     def load(self):
@@ -798,23 +548,15 @@ class Config:
             try:
                 with open(self.path, encoding="utf-8") as f:
                     d = json.load(f)
-                if not isinstance(d, dict):
-                    raise ValueError("config phải là object")
-                run_config = normalize_run_config(d.get("run_config"))
+                self.xsmm_token = d.get("xsmm_token", "")
+                self.debug = bool(d.get("debug", False))
             except Exception as e:
-                raise ValueError(f"Config load lỗi: {e}") from e
-            self.xsmm_token = d.get("xsmm_token", "")
-            self.debug = bool(d.get("debug", False))
-            self.run_config = run_config
+                log.warning(f"Config load lỗi: {e}")
 
     def save(self):
-        self.run_config = normalize_run_config(self.run_config)
         with open(self.path, "w", encoding="utf-8") as f:
-            json.dump({
-                "xsmm_token": self.xsmm_token,
-                "debug": self.debug,
-                "run_config": self.run_config,
-            }, f, indent=2)
+            json.dump({"xsmm_token": self.xsmm_token, "debug": self.debug},
+                      f, indent=2)
 
 
 class AccountStore:
@@ -868,6 +610,7 @@ class AccountStore:
             "username": username,
             "xsmm_id": xsmm_id,
             "enabled": True,
+            "fail_count": 0,
             "added_at": datetime.now().isoformat(timespec="seconds"),
         }
         self.accounts.append(acc)
@@ -899,28 +642,23 @@ class AccountStore:
 
 # ====================================================================== #
 class IGTaskWorker:
-    def __init__(self, xsmm, store, run_config=None, batch_size=15):
+    MAX_FAIL = 3   # fail 3 lần liên tiếp mới tắt acc
+
+    def __init__(self, xsmm, store,
+                 min_delay=2.0, max_delay=5.0,
+                 jobs_per_cycle=0, cycle_sleep=60,
+                 batch_size=15, empty_sleep=10,
+                 follow_cache_min=8, follow_cache_max=12):
         self.xsmm = xsmm
         self.store = store
-        config = normalize_run_config(run_config)
-        self.like_delay_range = (
-            config["like_delay_min"], config["like_delay_max"]
-        )
-        self.follow_delay_range = (
-            config["follow_delay_min"], config["follow_delay_max"]
-        )
-        self.failed_delay_range = (
-            config["failed_delay_min"], config["failed_delay_max"]
-        )
-        self.account_delay_range = (
-            config["account_delay_min"], config["account_delay_max"]
-        )
-        self.jobs_per_cycle = config["jobs_per_cycle"]
-        self.cycle_sleep = config["cycle_sleep"]
+        self.min_delay = min_delay
+        self.max_delay = max_delay
+        self.jobs_per_cycle = jobs_per_cycle
+        self.cycle_sleep = cycle_sleep
         self.batch_size = batch_size
-        self.empty_sleep = config["empty_sleep"]
-        self.follow_cache_min = config["follow_cache_min"]
-        self.follow_cache_max = config["follow_cache_max"]
+        self.empty_sleep = empty_sleep
+        self.follow_cache_min = follow_cache_min
+        self.follow_cache_max = follow_cache_max
 
         self.ig_cache = {}
         self.cycle_count = {}
@@ -929,6 +667,19 @@ class IGTaskWorker:
         self.total_fail = 0
         self.total_points = 0
         self.balance = 0
+
+    def _mark_fail(self, acc, reason=""):
+        acc["fail_count"] = acc.get("fail_count", 0) + 1
+        if acc["fail_count"] >= self.MAX_FAIL:
+            acc["enabled"] = False
+            self.store.save()
+            cprint(f"  ⚠ {acc.get('username') or acc['ds_user_id']}: "
+                   f"fail {acc['fail_count']} lần — tự động TẮT ({reason})", C.Y)
+
+    def _mark_ok(self, acc):
+        if acc.get("fail_count", 0) != 0:
+            acc["fail_count"] = 0
+            self.store.save()
 
     def _get_ig(self, acc):
         uid = acc["ds_user_id"]
@@ -942,32 +693,25 @@ class IGTaskWorker:
                 ok = ig.load()
                 sp.tick()
                 if not ok:
-                    message = ig.session_diagnostic_message()
-                    if ig.diagnostic_requires_disable(ig.last_session_diagnostic):
-                        cprint(f"  ⚠ {uid}: {message} — tự động TẮT", C.Y)
+                    reason = ig.load_error or "load fail"
+                    if ig.is_suspended():
+                        cprint(f"  ⚠ {uid}: SUSPENDED — tự động TẮT", C.R)
                         acc["enabled"] = False
                         self.store.save()
-                    else:
-                        cprint(f"  ⚠ {uid}: {message} — giữ tài khoản BẬT", C.Y)
-                    return None
-                if not ig.is_alive():
-                    message = ig.session_diagnostic_message()
-                    if ig.diagnostic_requires_disable(ig.last_session_diagnostic):
-                        cprint(f"  ⚠ {uid}: {message} — tự động TẮT", C.Y)
-                        acc["enabled"] = False
-                        self.store.save()
-                    else:
-                        cprint(f"  ⚠ {uid}: {message} — giữ tài khoản BẬT", C.Y)
+                        return None
+                    cprint(f"  ⚠ {uid}: {reason}", C.Y)
+                    self._mark_fail(acc, reason)
                     return None
                 sp.tick()
                 me = ig.me()
                 if me:
                     acc["username"] = me.get("username", "")
-                    self.store.save()
+                    self._mark_ok(acc)
                 self.ig_cache[uid] = ig
                 return ig
             except Exception as e:
                 cprint(f"  ⚠ {uid}: init lỗi: {e}", C.Y)
+                self._mark_fail(acc, str(e))
                 return None
 
     def _ensure_xsmm_id(self, acc, ig):
@@ -992,25 +736,6 @@ class IGTaskWorker:
         if task_type == "instagram_follow":
             return ig.follow(target)
         return False
-
-    def _action_delay_range(self, task_type, succeeded):
-        if not succeeded:
-            return self.failed_delay_range
-        if task_type == "instagram_like":
-            return self.like_delay_range
-        if task_type == "instagram_follow":
-            return self.follow_delay_range
-        raise ValueError(f"Loại task không hỗ trợ delay: {task_type}")
-
-    def _wait_action_delay(self, task_type, succeeded):
-        delay = random.uniform(*self._action_delay_range(task_type, succeeded))
-        spin_wait(delay, f"chờ {delay:.1f}s")
-
-    def _wait_account_delay(self):
-        if self.account_delay_range == (0.0, 0.0):
-            return
-        delay = random.uniform(*self.account_delay_range)
-        spin_wait(delay, f"chờ chuyển account {delay:.1f}s")
 
     def _log_success(self, label, task_type, task_id, points, num, bal):
         print(
@@ -1062,7 +787,6 @@ class IGTaskWorker:
 
     # ------------------------------------------------------------------ #
     def _check_live_accounts(self):
-        """Check live toàn bộ account enabled, tắt những acc bị suspended."""
         enabled = self.store.enabled()
         if not enabled:
             return
@@ -1076,26 +800,16 @@ class IGTaskWorker:
             uid = acc["ds_user_id"]
             uname = acc.get("username") or "?"
 
-            ig = self.ig_cache.get(uid)
-            if ig is None:
-                try:
-                    ig = InstagramAPI(acc["cookie"])
-                    if not ig.load():
-                        message = ig.session_diagnostic_message()
-                        if ig.diagnostic_requires_disable(ig.last_session_diagnostic):
-                            print(f"  {C.R}✗ {uname} — {message} (tắt){C.RS}")
-                            acc["enabled"] = False
-                            self.store.save()
-                            dead.append(uname)
-                        else:
-                            print(f"  {C.Y}⚠ {uname} — {message} (giữ bật){C.RS}")
-                        continue
-                    self.ig_cache[uid] = ig
-                except Exception as e:
-                    print(f"  {C.Y}⚠ {uname} — {e} (giữ bật){C.RS}")
-                    continue
+            try:
+                ig = InstagramAPI(acc["cookie"])
+                ok = ig.load()
+            except Exception as e:
+                print(f"  {C.R}✗ {uname} — {e} (tắt){C.RS}")
+                acc["enabled"] = False
+                self.store.save()
+                dead.append(uname)
+                continue
 
-            # check suspended trước
             if ig.is_suspended():
                 print(f"  {C.R}✗ {uname} — SUSPENDED (tự động TẮT){C.RS}")
                 acc["enabled"] = False
@@ -1103,17 +817,13 @@ class IGTaskWorker:
                 dead.append(uname)
                 continue
 
-            # check session
-            if not ig.is_alive():
-                message = ig.session_diagnostic_message()
-                if ig.diagnostic_requires_disable(ig.last_session_diagnostic):
-                    print(f"  {C.R}✗ {uname} — {message} (tự động TẮT){C.RS}")
-                    acc["enabled"] = False
-                    self.store.save()
-                    dead.append(uname)
-                else:
-                    print(f"  {C.Y}⚠ {uname} — {message} (giữ bật){C.RS}")
+            if not ok:
+                self._mark_fail(acc, ig.load_error or "")
+                print(f"  {C.Y}✗ {uname} — {ig.load_error} "
+                      f"(fail {acc['fail_count']}/{self.MAX_FAIL}){C.RS}")
             else:
+                self._mark_ok(acc)
+                self.ig_cache[uid] = ig
                 print(f"  {C.G}✓ {uname} — live{C.RS}")
 
         if dead:
@@ -1180,7 +890,8 @@ class IGTaskWorker:
             else:
                 self.total_fail += 1
 
-            self._wait_action_delay(task_type, ok)
+            delay = random.uniform(self.min_delay, self.max_delay)
+            spin_wait(delay, f"chờ {delay:.1f}s")
 
             if self.jobs_per_cycle and self.cycle_count.get(uid, 0) >= self.jobs_per_cycle:
                 countdown_wait(
@@ -1218,8 +929,7 @@ class IGTaskWorker:
                     break
 
                 round_has_work = False
-                round_accounts = self.store.enabled()
-                for account_index, acc in enumerate(round_accounts):
+                for acc in self.store.enabled():
                     if total_jobs and self.total_done >= total_jobs:
                         break
                     for tt in task_types:
@@ -1234,12 +944,6 @@ class IGTaskWorker:
                         except Exception as e:
                             cprint(f"Account {acc['ds_user_id']} lỗi: {e}", C.R)
 
-                    has_next_account = account_index < len(round_accounts) - 1
-                    reached_total = total_jobs and self.total_done >= total_jobs
-                    if has_next_account and not reached_total:
-                        self._wait_account_delay()
-
-                # ─── CHECK LIVE sau mỗi round ───
                 self._check_live_accounts()
 
                 if not round_has_work:
@@ -1323,16 +1027,12 @@ def add_account(store, config):
     try:
         with Spinner("Đang load IG session...") as sp:
             ig = InstagramAPI(cookie)
-            if not ig.load():
-                sp.tick()
-                cprint(f"✗ {ig.session_diagnostic_message()}", C.R)
-                return
+            ok = ig.load()
             sp.tick()
             if ig.is_suspended():
                 cprint("✗ Account bị SUSPENDED", C.R); return
-            if not ig.is_alive():
-                cprint(f"✗ {ig.session_diagnostic_message()}", C.R)
-                return
+            if not ok:
+                cprint(f"✗ Session die: {ig.load_error}", C.R); return
             me = ig.me()
             sp.tick()
         if not me or not me.get("username"):
@@ -1379,6 +1079,8 @@ def toggle_account(store):
             a = x; break
     if a:
         a["enabled"] = not a.get("enabled", True)
+        if a["enabled"]:
+            a["fail_count"] = 0
         store.save()
         status = f"{C.G}BẬT{C.RS}" if a['enabled'] else f"{C.R}TẮT{C.RS}"
         cprint(f"✓ {a.get('username') or a['ds_user_id']} → {status}", C.G)
@@ -1528,88 +1230,30 @@ def choose_task_types():
         cprint("Không hợp lệ.", C.R)
 
 
-def prompt_integer(prompt, current, minimum_allowed=0):
-    while True:
-        raw = input(f"{C.Cy}{prompt} [{current}]: {C.RS}").strip()
-        if not raw:
-            return current
-        try:
-            return validate_integer(int(raw), prompt, minimum_allowed)
-        except ValueError as e:
-            cprint(f"✗ {e}", C.R)
-
-
-def prompt_number_range(label, current_min, current_max):
-    while True:
-        raw_min = input(
-            f"{C.Cy}{label} tối thiểu [{current_min:g}]: {C.RS}"
-        ).strip()
-        raw_max = input(
-            f"{C.Cy}{label} tối đa [{current_max:g}]: {C.RS}"
-        ).strip()
-        try:
-            minimum = current_min if not raw_min else float(raw_min)
-            maximum = current_max if not raw_max else float(raw_max)
-            return validate_number_range(minimum, maximum, label)
-        except ValueError as e:
-            cprint(f"✗ {e}. Vui lòng nhập lại cả min/max.", C.R)
-
-
-def prompt_integer_range(label, current_min, current_max, minimum_allowed=0):
-    while True:
-        minimum = prompt_integer(f"{label} min", current_min, minimum_allowed)
-        maximum = prompt_integer(f"{label} max", current_max, minimum_allowed)
-        if minimum <= maximum:
-            return minimum, maximum
-        cprint(f"✗ {label} min không được lớn hơn max. Vui lòng nhập lại.", C.R)
-
-
-def config_run(config, enabled_account_count):
+def config_run():
     header("CẤU HÌNH CHẠY")
-    current = normalize_run_config(config.run_config)
-    candidate = dict(current)
-
-    candidate["total_jobs"] = prompt_integer(
-        "Số job muốn chạy (0 = vô hạn)", current["total_jobs"]
-    )
-    for prefix, label in (
-        ("like_delay", "Like delay (giây)"),
-        ("follow_delay", "Follow delay (giây)"),
-        ("failed_delay", "Failed delay (giây)"),
-    ):
-        candidate[f"{prefix}_min"], candidate[f"{prefix}_max"] = \
-            prompt_number_range(
-                label, current[f"{prefix}_min"], current[f"{prefix}_max"]
-            )
-
-    if enabled_account_count > 1:
-        candidate["account_delay_min"], candidate["account_delay_max"] = \
-            prompt_number_range(
-                "Account delay (giây)",
-                current["account_delay_min"], current["account_delay_max"],
-            )
-
-    candidate["jobs_per_cycle"] = prompt_integer(
-        "Nghỉ sau bao nhiêu job (0 = không nghỉ)", current["jobs_per_cycle"]
-    )
-    per_cycle = candidate["jobs_per_cycle"]
+    total = ask("Số job muốn chạy (0 = vô hạn): ", default=0, cast=int)
+    min_d = ask("Delay tối thiểu mỗi job (giây) [2]: ", default=2.0, cast=float)
+    max_d = ask("Delay tối đa mỗi job (giây) [5]: ", default=5.0, cast=float)
+    per_cycle = ask("Nghỉ sau bao nhiêu job (0 = không nghỉ) [0]: ",
+                    default=0, cast=int)
+    cycle_sleep = 0
     if per_cycle > 0:
-        candidate["cycle_sleep"] = prompt_integer(
-            "Thời gian nghỉ chu kỳ (giây)", current["cycle_sleep"]
-        )
-    candidate["empty_sleep"] = prompt_integer(
-        "Nghỉ khi hết task (giây)", current["empty_sleep"]
-    )
-    candidate["follow_cache_min"], candidate["follow_cache_max"] = \
-        prompt_integer_range(
-            "Cache follow", current["follow_cache_min"],
-            current["follow_cache_max"], minimum_allowed=1,
-        )
+        cycle_sleep = ask("Thời gian nghỉ (giây) [60]: ", default=60, cast=int)
+    empty_sleep = ask("Nghỉ khi hết task (giây) [10]: ", default=10, cast=int)
+
+    fc_min = ask("Cache follow - min [8]: ", default=8, cast=int)
+    fc_max = ask("Cache follow - max [12]: ", default=12, cast=int)
+    if fc_max < fc_min:
+        fc_max = fc_min
 
     print()
-    config.run_config = normalize_run_config(candidate)
-    config.save()
-    return dict(config.run_config)
+    return {
+        "total_jobs": total, "min_delay": min_d, "max_delay": max_d,
+        "jobs_per_cycle": per_cycle, "cycle_sleep": cycle_sleep,
+        "empty_sleep": empty_sleep,
+        "follow_cache_min": fc_min, "follow_cache_max": fc_max,
+    }
 
 
 def main_menu():
@@ -1652,11 +1296,18 @@ def main_menu():
             task_types = choose_task_types()
             if not task_types:
                 continue
-            cfg = config_run(config, len(store.enabled()))
+            cfg = config_run()
 
             xsmm = XsmmClient(config.xsmm_token, debug=config.debug)
             worker = IGTaskWorker(
-                xsmm, store, run_config=cfg,
+                xsmm, store,
+                min_delay=cfg["min_delay"],
+                max_delay=cfg["max_delay"],
+                jobs_per_cycle=cfg["jobs_per_cycle"],
+                cycle_sleep=cfg["cycle_sleep"],
+                empty_sleep=cfg["empty_sleep"],
+                follow_cache_min=cfg["follow_cache_min"],
+                follow_cache_max=cfg["follow_cache_max"],
             )
             worker.run(task_types, total_jobs=cfg["total_jobs"])
             pause()
