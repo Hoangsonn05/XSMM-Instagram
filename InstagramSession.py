@@ -9,6 +9,7 @@ import math
 import logging
 import requests
 from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
 from colorama import init, Fore, Style
 
 init(autoreset=True)
@@ -143,6 +144,10 @@ class InstagramAPI:
     BASE = "https://www.instagram.com"
     APP_ID = "936619743392459"
 
+    SESSION_DISABLE_STATUSES = frozenset({
+        "AUTH_INVALID", "LOGIN_REQUIRED", "CHECKPOINT", "SUSPENDED",
+    })
+
     DOC_LIKE = ("usePolarisLikeMediaXIGLikeMutation", "27182485238052618")
     DOC_UNLIKE = ("usePolarisUnlikeMediaXIGUnlikeMutation", "27182485238052619")
     DOC_FOLLOW = ("usePolarisFollowUserFollowMutation", "27767812149509802")
@@ -163,6 +168,14 @@ class InstagramAPI:
         self.jazoest = None
         self.rev = None
         self.hs = None
+        self.last_session_diagnostic = {
+            "status": "UNKNOWN_RESPONSE",
+            "stage": "INIT",
+            "http_status": None,
+            "content_type": "",
+            "final_url": "",
+            "reason": "NOT_CHECKED",
+        }
         self.session = self._build_session()
 
     @staticmethod
@@ -201,12 +214,176 @@ class InstagramAPI:
     def load(self) -> bool:
         try:
             r = self.session.get(f"{self.BASE}/", timeout=self.timeout)
-        except Exception:
+        except requests.RequestException as exc:
+            self._set_session_diagnostic(
+                "NETWORK_ERROR", "LOAD_HOME",
+                reason=f"REQUEST_{type(exc).__name__.upper()}",
+            )
             return False
-        if r.status_code != 200:
+        except Exception as exc:
+            self._set_session_diagnostic(
+                "UNKNOWN_RESPONSE", "LOAD_HOME",
+                reason=f"UNEXPECTED_{type(exc).__name__.upper()}",
+            )
+            return False
+
+        status = getattr(r, "status_code", None)
+        marker_status = self._classify_response_marker(r)
+        if status == 429:
+            self._set_session_diagnostic(
+                "RATE_LIMITED", "LOAD_HOME", r, "HTTP_429",
+            )
+            return False
+        if marker_status:
+            self._set_session_diagnostic(
+                marker_status, "LOAD_HOME", r,
+                f"{marker_status}_MARKER",
+            )
+            return False
+        if status != 200:
+            diagnostic_status = "HTTP_ERROR" if status is not None else "UNKNOWN_RESPONSE"
+            self._set_session_diagnostic(
+                diagnostic_status, "LOAD_HOME", r,
+                f"HTTP_{status}" if status is not None else "MISSING_HTTP_STATUS",
+            )
             return False
         self._extract_tokens(r.text)
+        self._set_session_diagnostic("LOAD_OK", "LOAD_HOME", r, "HOME_LOADED")
         return True
+
+    @staticmethod
+    def _safe_url(value) -> str:
+        """Keep only URL origin/path so diagnostics never retain query secrets."""
+        if not value:
+            return ""
+        try:
+            parts = urlsplit(str(value))
+            hostname = parts.hostname or ""
+            if ":" in hostname:
+                hostname = f"[{hostname}]"
+            port = f":{parts.port}" if parts.port is not None else ""
+            return urlunsplit((parts.scheme, f"{hostname}{port}",
+                               parts.path, "", ""))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _response_headers(response) -> dict:
+        headers = getattr(response, "headers", None)
+        return headers if hasattr(headers, "get") else {}
+
+    def _set_session_diagnostic(self, status, stage, response=None, reason=""):
+        headers = self._response_headers(response) if response is not None else {}
+        self.last_session_diagnostic = {
+            "status": status,
+            "stage": stage,
+            "http_status": getattr(response, "status_code", None)
+            if response is not None else None,
+            "content_type": str(headers.get("content-type", "") or ""),
+            "final_url": self._safe_url(getattr(response, "url", ""))
+            if response is not None else "",
+            "reason": reason,
+        }
+        return self.last_session_diagnostic
+
+    @classmethod
+    def _classify_response_marker(cls, response, json_data=None):
+        headers = cls._response_headers(response)
+        final_url = cls._safe_url(getattr(response, "url", "")).lower()
+        location = cls._safe_url(headers.get("location", "")).lower()
+        url_evidence = f"{final_url} {location}"
+
+        if any(marker in url_evidence for marker in
+               ("/challenge", "/checkpoint")):
+            return "CHECKPOINT"
+        if "/accounts/suspended" in url_evidence:
+            return "SUSPENDED"
+        if "/accounts/login" in url_evidence:
+            return "LOGIN_REQUIRED"
+
+        evidence_parts = []
+        if json_data is not None:
+            cls._collect_error_evidence(json_data, evidence_parts)
+        try:
+            body = str(getattr(response, "text", "") or "")[:100000].lower()
+        except Exception:
+            body = ""
+        evidence = " ".join(evidence_parts).lower()
+        if (any(marker in evidence for marker in (
+                "checkpoint_url", "checkpoint_required",
+                "challenge_required", "challenge_url")) or
+                any(marker in body for marker in (
+                    '"checkpoint_url":', '"challenge_url":',
+                    '"message":"challenge_required"'))):
+            return "CHECKPOINT"
+        if (any(marker in evidence for marker in (
+                "login_required", "login required", "please log in",
+                "not logged in")) or
+                any(marker in body for marker in (
+                    '"message":"login_required"',
+                    '<title>login • instagram</title>',
+                    'id="loginform"'))):
+            return "LOGIN_REQUIRED"
+        if any(marker in evidence for marker in (
+                "rate_limit", "rate limit", "too many requests",
+                "please wait a few minutes")):
+            return "RATE_LIMITED"
+        if any(marker in evidence for marker in (
+                "invalid_session", "invalid session", "session_expired",
+                "session expired", "invalid cookie")):
+            return "AUTH_INVALID"
+        return None
+
+    @classmethod
+    def _collect_error_evidence(cls, value, output, depth=0):
+        """Inspect bounded error metadata internally; never store response data."""
+        if depth > 4 or len(output) >= 30:
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized = str(key).lower()
+                if normalized in {
+                    "message", "error", "error_type", "error_title",
+                    "code", "error_code", "status", "checkpoint_url",
+                    "challenge", "challenge_url",
+                } and isinstance(item, (str, int, float, bool)):
+                    output.append(f"{normalized}:{str(item)[:500]}")
+                elif isinstance(item, (dict, list)):
+                    cls._collect_error_evidence(item, output, depth + 1)
+        elif isinstance(value, list):
+            for item in value[:20]:
+                cls._collect_error_evidence(item, output, depth + 1)
+
+    @staticmethod
+    def _parse_json_response(response):
+        try:
+            return True, response.json()
+        except Exception:
+            return False, None
+
+    @classmethod
+    def diagnostic_requires_disable(cls, diagnostic) -> bool:
+        return bool(diagnostic) and diagnostic.get("status") in cls.SESSION_DISABLE_STATUSES
+
+    def session_diagnostic_message(self) -> str:
+        diagnostic = self.last_session_diagnostic or {}
+        status = diagnostic.get("status", "UNKNOWN_RESPONSE")
+        messages = {
+            "AUTH_INVALID": "Session/cookie không còn hợp lệ",
+            "LOGIN_REQUIRED": "Instagram yêu cầu đăng nhập lại",
+            "CHECKPOINT": "Instagram yêu cầu checkpoint/xác minh",
+            "SUSPENDED": "Tài khoản Instagram bị suspended",
+            "RATE_LIMITED": "Instagram đang giới hạn request",
+            "NETWORK_ERROR": "Không kiểm tra được session do lỗi mạng",
+            "NON_JSON_RESPONSE": "Instagram trả response không phải JSON",
+            "MALFORMED_RESPONSE": "Instagram trả response sai cấu trúc",
+            "UNKNOWN_RESPONSE": "Không xác định được trạng thái session",
+        }
+        if status == "HTTP_ERROR":
+            code = diagnostic.get("http_status")
+            suffix = f": HTTP {code}" if code is not None else ""
+            return f"Kiểm tra session thất bại{suffix}"
+        return messages.get(status, "Không xác định được trạng thái session")
 
     def _extract_tokens(self, html: str):
         m = re.findall(r'"DTSGInitialData",\[\],\{"token":"([^"]+)"\}', html)
@@ -298,12 +475,72 @@ class InstagramAPI:
                 ("username", "full_name", "pk", "follower_count", "following_count")}
 
     def is_alive(self):
+        return self.diagnose_session().get("status") == "LIVE"
+
+    def diagnose_session(self):
         try:
             r = self.get(f"/api/v1/users/{self.ds_user_id}/info/")
-        except Exception:
-            return False
-        return (r.status_code == 200 and
-                r.headers.get("content-type", "").startswith("application/json"))
+        except requests.RequestException as exc:
+            return self._set_session_diagnostic(
+                "NETWORK_ERROR", "ALIVE_CHECK",
+                reason=f"REQUEST_{type(exc).__name__.upper()}",
+            )
+        except Exception as exc:
+            return self._set_session_diagnostic(
+                "UNKNOWN_RESPONSE", "ALIVE_CHECK",
+                reason=f"UNEXPECTED_{type(exc).__name__.upper()}",
+            )
+
+        status = getattr(r, "status_code", None)
+        parsed, data = self._parse_json_response(r)
+        marker_status = self._classify_response_marker(
+            r, data if parsed else None,
+        )
+        if status == 429:
+            return self._set_session_diagnostic(
+                "RATE_LIMITED", "ALIVE_CHECK", r, "HTTP_429",
+            )
+        if marker_status:
+            return self._set_session_diagnostic(
+                marker_status, "ALIVE_CHECK", r,
+                f"{marker_status}_MARKER",
+            )
+        if status != 200:
+            diagnostic_status = "HTTP_ERROR" if status is not None else "UNKNOWN_RESPONSE"
+            return self._set_session_diagnostic(
+                diagnostic_status, "ALIVE_CHECK", r,
+                f"HTTP_{status}" if status is not None else "MISSING_HTTP_STATUS",
+            )
+        if not parsed:
+            return self._set_session_diagnostic(
+                "NON_JSON_RESPONSE", "ALIVE_CHECK", r,
+                "JSON_PARSE_FAILED",
+            )
+        if not isinstance(data, dict):
+            return self._set_session_diagnostic(
+                "MALFORMED_RESPONSE", "ALIVE_CHECK", r,
+                "ROOT_NOT_OBJECT",
+            )
+        user = data.get("user")
+        if not isinstance(user, dict) or not user:
+            return self._set_session_diagnostic(
+                "MALFORMED_RESPONSE", "ALIVE_CHECK", r,
+                "USER_OBJECT_MISSING",
+            )
+        user_id = user.get("pk", user.get("id"))
+        if user_id is not None and str(user_id) != str(self.ds_user_id):
+            return self._set_session_diagnostic(
+                "MALFORMED_RESPONSE", "ALIVE_CHECK", r,
+                "USER_ID_MISMATCH",
+            )
+        if user_id is None and not user.get("username"):
+            return self._set_session_diagnostic(
+                "MALFORMED_RESPONSE", "ALIVE_CHECK", r,
+                "USER_IDENTITY_MISSING",
+            )
+        return self._set_session_diagnostic(
+            "LIVE", "ALIVE_CHECK", r, "VALID_USER_OBJECT",
+        )
 
     def is_suspended(self) -> bool:
         """
@@ -705,14 +942,22 @@ class IGTaskWorker:
                 ok = ig.load()
                 sp.tick()
                 if not ok:
-                    cprint(f"  ⚠ {uid}: load fail — tự động TẮT", C.Y)
-                    acc["enabled"] = False
-                    self.store.save()
+                    message = ig.session_diagnostic_message()
+                    if ig.diagnostic_requires_disable(ig.last_session_diagnostic):
+                        cprint(f"  ⚠ {uid}: {message} — tự động TẮT", C.Y)
+                        acc["enabled"] = False
+                        self.store.save()
+                    else:
+                        cprint(f"  ⚠ {uid}: {message} — giữ tài khoản BẬT", C.Y)
                     return None
                 if not ig.is_alive():
-                    cprint(f"  ⚠ {uid}: session chết — tự động TẮT", C.Y)
-                    acc["enabled"] = False
-                    self.store.save()
+                    message = ig.session_diagnostic_message()
+                    if ig.diagnostic_requires_disable(ig.last_session_diagnostic):
+                        cprint(f"  ⚠ {uid}: {message} — tự động TẮT", C.Y)
+                        acc["enabled"] = False
+                        self.store.save()
+                    else:
+                        cprint(f"  ⚠ {uid}: {message} — giữ tài khoản BẬT", C.Y)
                     return None
                 sp.tick()
                 me = ig.me()
@@ -723,8 +968,6 @@ class IGTaskWorker:
                 return ig
             except Exception as e:
                 cprint(f"  ⚠ {uid}: init lỗi: {e}", C.Y)
-                acc["enabled"] = False
-                self.store.save()
                 return None
 
     def _ensure_xsmm_id(self, acc, ig):
@@ -838,17 +1081,18 @@ class IGTaskWorker:
                 try:
                     ig = InstagramAPI(acc["cookie"])
                     if not ig.load():
-                        print(f"  {C.R}✗ {uname} — load fail (tắt){C.RS}")
-                        acc["enabled"] = False
-                        self.store.save()
-                        dead.append(uname)
+                        message = ig.session_diagnostic_message()
+                        if ig.diagnostic_requires_disable(ig.last_session_diagnostic):
+                            print(f"  {C.R}✗ {uname} — {message} (tắt){C.RS}")
+                            acc["enabled"] = False
+                            self.store.save()
+                            dead.append(uname)
+                        else:
+                            print(f"  {C.Y}⚠ {uname} — {message} (giữ bật){C.RS}")
                         continue
                     self.ig_cache[uid] = ig
                 except Exception as e:
-                    print(f"  {C.R}✗ {uname} — {e} (tắt){C.RS}")
-                    acc["enabled"] = False
-                    self.store.save()
-                    dead.append(uname)
+                    print(f"  {C.Y}⚠ {uname} — {e} (giữ bật){C.RS}")
                     continue
 
             # check suspended trước
@@ -861,10 +1105,14 @@ class IGTaskWorker:
 
             # check session
             if not ig.is_alive():
-                print(f"  {C.Y}✗ {uname} — session chết (tự động TẮT){C.RS}")
-                acc["enabled"] = False
-                self.store.save()
-                dead.append(uname)
+                message = ig.session_diagnostic_message()
+                if ig.diagnostic_requires_disable(ig.last_session_diagnostic):
+                    print(f"  {C.R}✗ {uname} — {message} (tự động TẮT){C.RS}")
+                    acc["enabled"] = False
+                    self.store.save()
+                    dead.append(uname)
+                else:
+                    print(f"  {C.Y}⚠ {uname} — {message} (giữ bật){C.RS}")
             else:
                 print(f"  {C.G}✓ {uname} — live{C.RS}")
 
@@ -1076,12 +1324,15 @@ def add_account(store, config):
         with Spinner("Đang load IG session...") as sp:
             ig = InstagramAPI(cookie)
             if not ig.load():
-                sp.tick(); cprint("✗ Không load được IG", C.R); return
+                sp.tick()
+                cprint(f"✗ {ig.session_diagnostic_message()}", C.R)
+                return
             sp.tick()
             if ig.is_suspended():
                 cprint("✗ Account bị SUSPENDED", C.R); return
             if not ig.is_alive():
-                cprint("✗ Session chết", C.R); return
+                cprint(f"✗ {ig.session_diagnostic_message()}", C.R)
+                return
             me = ig.me()
             sp.tick()
         if not me or not me.get("username"):
